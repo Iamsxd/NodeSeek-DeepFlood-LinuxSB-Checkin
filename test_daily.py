@@ -35,7 +35,8 @@ def _install_stub_modules():
             return self
 
     stub("undetected_chromedriver", Chrome=_Anything(), ChromeOptions=_Anything())
-    stub("bs4", BeautifulSoup=_Anything())
+    from bs4 import BeautifulSoup
+    stub("bs4", BeautifulSoup=BeautifulSoup)
 
     stub("selenium")
     stub("selenium.webdriver")

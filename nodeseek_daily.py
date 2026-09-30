@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import time
 import traceback
+import unicodedata
 from urllib.parse import urlsplit, urlunsplit
 import undetected_chromedriver as uc
 from selenium.webdriver.common.keys import Keys
@@ -56,6 +57,54 @@ def should_skip_cookie(name):
     return any(lowered.startswith(prefix) for prefix in SKIP_COOKIE_PREFIXES)
 
 
+COOKIE_NAME_PATTERN = re.compile(r'^[A-Za-z0-9!#$%&\'*+\-.^_`|~]+$')
+COOKIE_NAME_CHAR_PATTERN = re.compile(r'[A-Za-z0-9!#$%&\'*+\-.^_`|~]')
+_COOKIE_FLAG_PREFIXES = ("-h", "--header", "--cookie", "-b")
+_INVISIBLE_CHARS_PATTERN = re.compile('[\ufeff\u200b\u200c\u200d]')
+_FRAGMENT_CHAR_HINTS = {
+    "Cf": "不可见格式字符（可能是 BOM 或零宽字符）",
+    "Pi": "引号",
+    "Pf": "引号",
+    "Po": "标点符号（可能是引号或冒号）",
+    "Zs": "空白字符",
+    "Pd": "连字符",
+    "Lo": "中文等表意文字（可能粘进了说明文字）",
+}
+MIN_ORPHAN_TOKEN_LENGTH = 8
+
+
+def strip_cookie_wrappers(raw):
+    """剥离 Cookie 请求头、curl 参数、成对引号和粘贴时混入的不可见字符。"""
+    text = _INVISIBLE_CHARS_PATTERN.sub('', raw).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        text = text[1:-1].strip()
+
+    for flag in _COOKIE_FLAG_PREFIXES:
+        lowered = text.lower()
+        if lowered.startswith(flag + " ") or lowered.startswith(flag + "="):
+            text = text[len(flag) + 1:].strip()
+            if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+                text = text[1:-1].strip()
+            break
+
+    for prefix in ("set-cookie:", "cookie:"):
+        if text.lower().startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+    return text
+
+
+def describe_fragment(segment):
+    """仅描述异常片段的长度与字符类别，不输出可能含凭据的内容。"""
+    detail = f"长度 {len(segment)}，" + ("含等号" if '=' in segment else "不含等号")
+    for char in segment.partition('=')[0].strip():
+        if not COOKIE_NAME_CHAR_PATTERN.match(char):
+            category = unicodedata.category(char)
+            detail += f"，首个非法字符：{_FRAGMENT_CHAR_HINTS.get(category, f'类别 {category}')}"
+            break
+    return detail
+
+
 def parse_cookie_string(raw):
     """
     解析 NS_COOKIE 字符串，返回 (待注入的 (name, value) 列表, 跳过原因列表)。
@@ -73,8 +122,7 @@ def parse_cookie_string(raw):
     if not raw:
         return pairs, skipped
 
-    # cookie 名称的合法字符集（RFC 6265 token），据此判断一段是否为新 cookie 的开头
-    name_pattern = re.compile(r'^[A-Za-z0-9!#$%&\'*+\-.^_`|~]+$')
+    raw = strip_cookie_wrappers(raw)
 
     for chunk in re.split(r'[;\r\n]+', raw):
         segment = chunk.strip()
@@ -82,7 +130,7 @@ def parse_cookie_string(raw):
             continue
 
         name, sep, value = segment.partition('=')
-        is_new_cookie = bool(sep) and bool(name_pattern.match(name.strip()))
+        is_new_cookie = bool(sep) and bool(COOKIE_NAME_PATTERN.match(name.strip()))
 
         if is_new_cookie:
             pairs.append([name.strip(), value.strip()])
@@ -90,8 +138,10 @@ def parse_cookie_string(raw):
             # 不像新 cookie，说明上一个 cookie 的值里含分号或换行，拼回去
             pairs[-1][1] = f"{pairs[-1][1]};{segment}"
         else:
-            # 开头就是异常片段，无法归属，只报告长度不输出内容
-            skipped.append(f"开头的异常片段（缺少合法 cookie 名），长度 {len(segment)}")
+            skipped.append(
+                f"开头的异常片段（{describe_fragment(segment)}）："
+                "cookie 串可能被截断或带了未识别的包裹，请重新复制完整 cookie"
+            )
 
     result = []
     for name, value in pairs:
@@ -101,6 +151,28 @@ def parse_cookie_string(raw):
         result.append((name, value))
 
     return result, skipped
+
+
+def cookie_has_login(site):
+    """session 字段仅用于失败诊断，实际登录态由账号概览确认。"""
+    pairs, _ = parse_cookie_string(site.cookie)
+    return any(name.strip().lower() == "session" for name, _ in pairs)
+
+
+def orphan_login_candidate(site):
+    """将足够长、无空白的开头无名片段作为候选凭据，调用方不得记录其值。"""
+    raw = strip_cookie_wrappers(site.cookie)
+    if not raw:
+        return None
+    first = re.split(r'[;\r\n]+', raw, maxsplit=1)[0].strip()
+    if not first or len(first) < MIN_ORPHAN_TOKEN_LENGTH:
+        return None
+    if any(char.isspace() for char in first):
+        return None
+    name, separator, _ = first.partition('=')
+    if separator and COOKIE_NAME_PATTERN.match(name.strip()):
+        return None
+    return first
 
 
 def parse_chrome_major_version(version_output):
@@ -243,10 +315,11 @@ if SITE_GAP_MIN > SITE_GAP_MAX:
     SITE_GAP_MIN, SITE_GAP_MAX = SITE_GAP_MAX, SITE_GAP_MIN
 
 
-# 页面已签到的文案特征。命中任一说明今日已领取，属于正常结果而非失败。
-# 注意签到后页面实际显示"今日签到获得鸡腿x个"，靠"今日签到"+"获得...鸡腿"
-# 这类收益句判断；纯"已签到"等字眼是早期猜测，保留作兼容。
-SIGNED_MARKERS = ("今日签到", "今日已签到", "已经签到", "明天再来", "请明天", "已签到")
+SIGNED_MARKERS = ("明天再来", "明日再来", "请明天")
+SIGNED_REWARD_PATTERN = re.compile(
+    r'签到(?![^。；;]{0,6}(?:可|能|将|会))[^。；;]{0,6}(?:获得|领取|奖励)[^。；;]{0,12}\d+\s*个?\s*鸡腿'
+    r'|签到(?![^。；;]{0,6}(?:可|能|将|会))[^。；;]{0,6}(?:获得|领取|奖励)[^。；;]{0,12}鸡腿\s*\d+\s*个?'
+)
 
 
 def cloudflare_challenge_signals(driver):
@@ -337,7 +410,7 @@ def fetch_account_summary(driver, site):
     """
     从指定站点主页抓取账号概览：等级、总鸡腿数，以及评论数、主题数等可见统计。
 
-    这些信息显示在主页左上角用户信息区，文案形如"等级 Lv 1""鸡腿 118"
+    只读取主页右侧含账号身份链接的用户卡片，文案形如"等级 Lv 1""鸡腿 118"
     "评论数 123""主题贴数 45"等。不同账号/时期可见字段可能略有差异，
     因此逐项独立解析，缺哪项就不带哪项，不影响其他项。
     解析失败时返回空列表，由调用方决定是否加入通知。
@@ -350,8 +423,16 @@ def fetch_account_summary(driver, site):
             return summary
         time.sleep(2)
 
-        text = BeautifulSoup(driver.page_source, 'html.parser').get_text(' ', strip=True)
-        # 各字段按"label + 数字"匹配，标签与数字之间允许空白
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        user_card = soup.select_one('#nsk-right-panel-container .user-card')
+        if user_card is None or user_card.select_one('a.Username[href*="/space/"]') is None:
+            print(f"[{site.name}] 未找到已登录账号卡片，登录态未确认", flush=True)
+            return summary
+        user_stats = user_card.select_one('.user-stat')
+        if user_stats is None:
+            print(f"[{site.name}] 未找到账号卡片统计区域，登录态未确认", flush=True)
+            return summary
+        text = user_stats.get_text(' ', strip=True)
         patterns = {
             'level': r'等级\s*(?:Lv\.?\s*)?(\d+)',
             'chicken_leg': r'鸡腿\s*(\d+(?:\.\d+)?)',
@@ -374,15 +455,22 @@ def fetch_account_summary(driver, site):
 
 def detect_already_signed(driver):
     """
-    判断签到页是否已显示"今日已签到"之类的文案。
-    用于区分"确实签过了"与"点击没生效"，避免后者被误报为成功。
+    仅以签到收尾文案或含数字的已领取收益句确认完成，不采信泛化的签到入口。
     """
     try:
         text = BeautifulSoup(driver.page_source, 'html.parser').get_text(' ', strip=True)
-        return any(marker in text for marker in SIGNED_MARKERS)
     except Exception as e:
         print(f"检测已签到状态失败: {str(e)}")
         return False
+
+    for marker in SIGNED_MARKERS:
+        if marker in text:
+            print(f"页面命中已签到收尾文案: {marker}", flush=True)
+            return True
+    if SIGNED_REWARD_PATTERN.search(text):
+        print("页面命中已签到收益句", flush=True)
+        return True
+    return False
 
 
 def detect_login_required(driver):
@@ -408,13 +496,13 @@ def detect_login_required(driver):
         return False
 
 
-def click_sign_icon(driver, site):
+def click_sign_icon(driver, site, logged_in=True):
     """
     执行指定站点签到：直接打开签到页 /board 并领取奖励。
 
     返回: {"success": bool, "detail": str}，detail 为通知用的中文结果描述。
-    只有确认领取成功或页面明确显示已签到才算成功；
-    既没领到又没有已签到标志时一律视为失败，避免掩盖真实问题。
+    logged_in 表示签到前已通过账号概览确认登录态，默认 True 兼容旧调用。
+    只有确认领取成功，或登录态已确认且页面明确显示已签到，才算成功。
     """
     try:
         print(f"[{site.name}] 正在打开签到页: {site.sign_url}", flush=True)
@@ -448,6 +536,16 @@ def click_sign_icon(driver, site):
         except Exception:
             # 找不到按钮，再核对是否为已签到状态
             print("未找到领取按钮，核对是否已签到...", flush=True)
+            if not logged_in:
+                if not cookie_has_login(site):
+                    if orphan_login_candidate(site):
+                        print("未确认登录态：开头的无名片段按登录凭据试注入仍无效，粘贴可能被截断或 cookie 已失效", flush=True)
+                    else:
+                        print("未确认登录态：cookie 串里没有 session 字段，粘贴可能不完整", flush=True)
+                else:
+                    print("未确认登录态：cookie 可能已失效或页面结构已变化", flush=True)
+                return {"success": False,
+                        "detail": "签到失败: 未确认登录态（cookie 可能不完整或已失效），页面也没有领取按钮"}
             if detect_already_signed(driver):
                 print("页面显示今日已签到", flush=True)
                 return {"success": True, "detail": "今日已签到"}
@@ -478,6 +576,9 @@ def click_sign_icon(driver, site):
             return {"success": True, "detail": f"签到成功，{reward}"}
 
         if detect_already_signed(driver):
+            if not logged_in:
+                print("点击后出现已签到文案，但登录态未确认，不按成功收尾", flush=True)
+                return {"success": False, "detail": "签到失败: 登录态未确认，无法确认签到结果"}
             print("点击后页面显示已签到", flush=True)
             return {"success": True, "detail": "签到成功"}
 
@@ -561,9 +662,23 @@ def inject_site_cookies(driver, site):
         # 首次访问可能落在 Cloudflare 挑战页，需等其自动放行后再注入 cookie
         wait_for_cloudflare(driver)
 
+        location = urlsplit(driver.current_url or "")
+        if location.scheme != "https" or location.hostname not in (site.domain, f"www.{site.domain}"):
+            print(f"[{site.name}] 当前页面不在本站 HTTPS 域名，拒绝注入 cookie", flush=True)
+            return False
+
         pairs, skipped = parse_cookie_string(site.cookie)
         for reason in skipped:
             print(f"[{site.name}] 跳过 cookie: {reason}", flush=True)
+
+        recovered_login = False
+        if not cookie_has_login(site):
+            orphan = orphan_login_candidate(site)
+            if orphan:
+                pairs.append(("session", orphan))
+                recovered_login = True
+                print(f"[{site.name}] 开头的无名片段（{describe_fragment(orphan)}）"
+                      "按候选登录凭据试注入，以账号概览确认是否生效", flush=True)
 
         injected = 0
         for name, value in pairs:
@@ -571,7 +686,6 @@ def inject_site_cookies(driver, site):
                 driver.add_cookie({
                     'name': name,
                     'value': value,
-                    'domain': site.cookie_domain,
                     'path': '/'
                 })
                 injected += 1
@@ -585,9 +699,9 @@ def inject_site_cookies(driver, site):
             print(f"[{site.name}] 没有任何有效 cookie 被注入，请检查 cookie 格式（应形如 session=xxx）")
             return False
 
-        if not any(name.lower() == 'session' for name, _ in pairs):
-            # session 是登录态所在，缺失时后续必然停在未登录页面，提前点明原因
-            print(f"[{site.name}] 警告: 未注入名为 session 的 cookie，登录态很可能不完整")
+        if not cookie_has_login(site) and not recovered_login:
+            print(f"[{site.name}] 提示: cookie 串里没有 session 字段，登录态可能不完整；"
+                  "session 是 HttpOnly cookie，需从浏览器「网络 → 该站请求 → 请求头 → Cookie」整段复制")
 
         print(f"[{site.name}] 刷新页面...", flush=True)
         driver.refresh()
@@ -741,6 +855,8 @@ def build_notify_content(site_results, task_started_at=None):
                 block.append(f"评论数: {account_summary['comment']}")
             if account_summary.get('topic'):
                 block.append(f"主题贴数: {account_summary['topic']}")
+        else:
+            block.append("账号概览: 未抓到（未登录或页面结构已变化）")
 
         # 附加任务被开关关闭时只说明状态，不输出无意义的 0/0 统计
         if comment_stats is None:
@@ -844,7 +960,21 @@ def run():
             site_results.append((site, {"success": False, "detail": "cookie 注入失败"}, None, {}, started_at))
             continue
 
-        # 评论与加鸡腿受 NS_EXTRA_TASKS 控制，关闭时只执行签到
+        recovered_login = not cookie_has_login(site) and bool(orphan_login_candidate(site))
+        print(f"[{site.name}] 抓取账号概览并确认登录态...")
+        account_summary = fetch_account_summary(driver, site)
+        logged_in = bool(account_summary)
+        if logged_in and recovered_login:
+            print(f"[{site.name}] 试注入后登录态已确认，本次无需重新粘贴 cookie", flush=True)
+        if not logged_in:
+            print(f"[{site.name}] 未抓到任何账号概览字段，登录态未确认", flush=True)
+            if recovered_login:
+                print(f"[{site.name}] 线索: 开头的无名片段按登录凭据试注入仍无效，"
+                      "粘贴可能被截断或 cookie 已失效，需重新登录后整段复制", flush=True)
+            elif not cookie_has_login(site):
+                print(f"[{site.name}] 线索: cookie 串里没有 session 字段（HttpOnly 项），"
+                      "粘贴可能不完整；若确认已整段复制，需检查 cookie 有效性", flush=True)
+
         if extra_tasks_enabled:
             print(f"[{site.name}] NS_EXTRA_TASKS 已开启，执行评论与加鸡腿任务")
             comment_stats = nodeseek_comment(driver, site)
@@ -852,10 +982,9 @@ def run():
             print(f"[{site.name}] NS_EXTRA_TASKS 未开启，仅执行签到")
             comment_stats = None
 
-        sign_result = click_sign_icon(driver, site)
+        sign_result = click_sign_icon(driver, site, logged_in=logged_in)
 
-        # 签到完成后顺带抓取账号概览，失败时也能在通知里看到当前状态
-        print(f"[{site.name}] 抓取账号概览...")
+        print(f"[{site.name}] 刷新任务后的账号概览...")
         account_summary = fetch_account_summary(driver, site)
 
         site_results.append((site, sign_result, comment_stats, account_summary, started_at))

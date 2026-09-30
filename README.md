@@ -32,6 +32,17 @@
 
 布尔类型变量接受 `true`/`1`/`yes`/`on`/`y`（大小写不敏感）为真，其余值一律为假。
 
+### Cookie 与登录态确认
+
+- 从浏览器「开发者工具 → 网络 → 该站请求 → 请求头 → Cookie」复制完整 Cookie，包含 HttpOnly 的 `session`。不要使用 `document.cookie`，它无法取得 HttpOnly 字段
+- 支持清理常见粘贴包裹：成对引号、`Cookie:` / `Set-Cookie:` 前缀、curl 的 `-H` / `--header` / `--cookie` / `-b` 参数及 BOM、零宽字符
+- 若开头出现足够长且无空白的无名片段，并且没有 `session`，会将其作为候选登录凭据试注入；不记录凭据值，也不会仅凭注入成功认定已登录
+- 签到前仅从含账号身份链接的账号卡片读取概览确认登录态，避免把公开帖子中的统计数字当成登录证据。「今日签到」等入口文案不再代表签到完成；没有领取按钮且未确认登录态时按失败处理，通知会说明账号概览未抓到
+- Cookie 仅注入本站的 HTTPS 页面，跨站重定向时拒绝注入；任务结束后重新抓取概览，通知使用签到后的统计
+- 本 fork 选择性整合上游 `e2ec6d5`、`638a978`、`7600d35` 的 NodeSeek / DeepFlood 修复，保留自身 Cloudflare 脱敏诊断与 LinuxSB 不执行的配置，不是完整合并上游历史
+
+账号卡片选择器参考公开客户端的 [XPathRules](https://github.com/tyrad/nodeseek/blob/900e1bfebcdb8d3ce73282433ccb425cc1e7da2e/nodeseek/SharedCore/Parsing/XPathRules.swift) 与 [Nodeseek Pro](https://github.com/rirh/nodeseek-plus/blob/69eb0b2ed22331307d6c2c34ad4652cc9f977468/references/upstream/nodeseek-pro.user.js)。若站点调整页面结构而无法确认登录态，按未确认处理，不回退到全页数字匹配。
+
 ### 关于多站点签到
 
 DeepFlood 是 NodeSeek 的子站，同一套论坛代码、同样的页面结构，只是独立域名与独立登录态。linux.sb（烧饼社区）则是另一套论坛程序（bbs1），同样挂在 Cloudflare 后面。各站配置情况：
