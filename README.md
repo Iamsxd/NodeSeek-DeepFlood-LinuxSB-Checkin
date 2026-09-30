@@ -1,12 +1,12 @@
 # NodeSeek 自动签到评论加鸡腿脚本
 
-这是一个用于 NodeSeek 及同站体系（DeepFlood）、并附带 linux.sb（烧饼社区）站的每日自动签到脚本。三站均使用 Selenium 和 undetected-chromedriver 应对 Cloudflare 防护；linux.sb 额外保留一条 requests 快速通道（`linuxsb_daily.py`），站点未开挑战时直接用它签到。三站可顺序执行、一站失败不影响其他站。
+这是一个用于 NodeSeek 及同站体系（DeepFlood）的每日自动签到脚本。GitHub Actions 仅运行 NodeSeek / DeepFlood，不再执行 LinuxSB。仓库保留 `linuxsb_daily.py` 供手动运行。浏览器运行不保证能够通过站点的 Cloudflare 验证。
 
 强烈建议修改随机词。否则容易被举报被禁言。有能力的可以fork后自己定义改。
 
 ## 功能特点
 
-- NodeSeek / DeepFlood / linux.sb 多站自动签到
+- NodeSeek / DeepFlood 多站自动签到；LinuxSB 仅保留手动运行
 - 自动点击"试试手气"或"鸡腿 x 5"按钮（可配置）
 - 随机选择帖子进行评论
 - 自动给帖子加鸡腿（7天内的帖子）
@@ -22,10 +22,10 @@
 
 - `NS_COOKIE`: NodeSeek 的 Cookie（必需）
 - `NS_RANDOM`: 是否随机选择奖励，true/false（可选，默认 false）
-- `HEADLESS`: 是否使用无头模式，true/false（可选，默认 true）。**注意 GitHub Actions 中需用有头模式（`false`）配合 xvfb 才能通过 Cloudflare 挑战**，workflow 已硬编码为 `false`，本地无显示环境时可用 `true`
+- `HEADLESS`: 是否使用无头模式，true/false（可选，默认 true）。GitHub Actions 使用 `false` 配合 xvfb 提供显示环境，但不保证能够通过 Cloudflare 挑战；本地无显示环境时可用 `true`
 - `NS_EXTRA_TASKS`: 除签到外的任务（评论、加鸡腿）总开关，true/false（可选，**默认 false**）
 - `DEEPFLOOD_COOKIE`: DeepFlood 子站的 Cookie（可选）。配置后会自动追加签到第二站；两站用同一套代码、同样页面结构，仅域名与 cookie 不同
-- `LINUXSB_COOKIE`: linux.sb（烧饼社区）的 Cookie（可选）。配置后会在 NodeSeek / DeepFlood 之后追加签到一站（`linuxsb_daily.py`）。该站 2026-08 起会**间歇性**开启 Cloudflare 托管挑战（同一出口 IP 可能上一轮 403、下一轮 200），脚本会先用 requests 探测：能直连就走 requests 快通道，被挑战（HTTP 403 + `Cf-Mitigated: challenge`）则自动把 Cookie 注入浏览器过盾后签到。多账号用 `&` 分隔（`cookie1&cookie2`），依次签到、单账号失败不中断
+- `LINUXSB_COOKIE`: 仅手动运行 `linuxsb_daily.py` 时使用，GitHub Actions 不再读取或执行 LinuxSB 配置。多账号用 `&` 分隔
 - `LINUXSB_ACCOUNT`: linux.sb 的账号密码兜底登录（可选），格式为 JSON：`{"username":"你的用户名","password":"你的密码"}`。**Cookie 优先**：`LINUXSB_COOKIE` 有效时完全不用凭据；Cookie 缺失或失效时自动用浏览器登录（算术题验证码由脚本解出填写，PoW 由页面 JS 计算），登录成功当场在同一浏览器会话内继续签到，无需手动换 cookie
 - `LINUXSB_FORCE_BROWSER`: 置 `1` 时 linux.sb 跳过 requests 探测直接走浏览器通道（可选）。用于站点长期开盾时省掉必然失败的探测，或在挑战未触发的时段验证浏览器通道
 - `SITE_GAP_MIN` / `SITE_GAP_MAX`: 各站签到之间的随机延迟范围（秒，可选，默认 60-180），降低连续签到被风控的概率
@@ -37,7 +37,7 @@
 DeepFlood 是 NodeSeek 的子站，同一套论坛代码、同样的页面结构，只是独立域名与独立登录态。linux.sb（烧饼社区）则是另一套论坛程序（bbs1），同样挂在 Cloudflare 后面。各站配置情况：
 
 - 配置 `DEEPFLOOD_COOKIE`：NodeSeek 与 DeepFlood 共用同一个浏览器实例，各自注入自己的 cookie 后签到，互不干扰
-- 配置 `LINUXSB_COOKIE`：NodeSeek / DeepFlood 完成后，workflow 追加执行 `linuxsb_daily.py` 完成第三站签到。requests 通道被 Cloudflare 挑战时自动改用浏览器（因此该步骤同样以 `xvfb-run` + `HEADLESS=false` 运行）
+- LinuxSB 不参与 GitHub Actions 自动签到；如需运行，可在本地单独执行 `python linuxsb_daily.py`
 - 无论配置几站，站与站之间都会随机等待 `SITE_GAP_MIN`~`SITE_GAP_MAX` 秒，避免两次签到紧挨着被判定为机器批量行为
 - 通知按站点分段显示，各自带自己的签到结果
 
@@ -110,9 +110,9 @@ NodeSeek 每日任务
 2. 在仓库的 Settings -> Secrets and variables -> Actions 中添加 Secret `NS_COOKIE`
 3. 可选：添加 `NS_RANDOM` 设置是否随机选择奖励
 4. 可选：需要评论和加鸡腿时，添加 `NS_EXTRA_TASKS=true`（不配置则只签到）
-5. 可选：配置多站签到 `DEEPFLOOD_COOKIE` / `LINUXSB_COOKIE`（不配置则只签 NodeSeek 一站；linux.sb 多账号用 `&` 分隔；linux.sb 可另配 `LINUXSB_ACCOUNT`（JSON 账号密码）作 cookie 失效时的自动登录兜底）
+5. 可选：配置 `DEEPFLOOD_COOKIE` 追加 DeepFlood 签到，不配置则只签 NodeSeek。LinuxSB 不再自动执行
 6. 可选：添加通知渠道的 Secrets（如 `WECOM_WEBHOOK` 或 `TG_BOT_TOKEN` + `TG_USER_ID`），workflow 已预置全部通知变量，未添加的自动跳过
-7. Actions 会在每天 UTC 00:00（北京时间 08:00）自动运行，也可在 Actions 页面手动触发（workflow_dispatch）
+7. Actions 配置为每天 UTC 00:38（北京时间 08:38）触发，也可在 Actions 页面手动触发（workflow_dispatch）。实际启动时间可能因队列延迟而明显晚于计划时间
 
 `NS_EXTRA_TASKS` 和 `NS_RANDOM` 这类非敏感开关既可以放在 Variables 也可以放在 Secrets，workflow 会优先取 Variables。放在 Variables 的好处是能在页面上直接看到当前值。
 
@@ -125,6 +125,14 @@ NodeSeek 每日任务
 - 某个渠道推送失败只打印日志，不会影响签到结果和其他渠道
 - GitHub Actions 中 Telegram 可能受网络限制，必要时用 `TG_API_HOST` 指向自建反代
 - 定时任务的实际触发时间受 GitHub Actions 队列影响，通常会比 08:00 晚几分钟到几十分钟
+
+### Cloudflare 失败诊断
+
+脚本不会仅因页面引用 `challenges.cloudflare.com` 的 Turnstile 脚本就判定整页被拦截，而会检查挑战标题、挑战配置和挑战容器。遇到真实挑战仍等待最多 60 秒，超时如实返回失败，不会把未完成的签到标记为成功。
+
+日志中的 `[页面诊断]` 只包含固定判定信号、脱敏 URL、标准挑战标题和浏览器版本，不输出 Cookie 值、页面源码、URL 查询参数或片段；未知路径和其他页面标题会隐藏。页面读取异常不会被当作通过验证。
+
+若后续日志仍显示明确的挑战信号，说明仍需检查站点验证要求或执行环境，不能仅靠这次判定修复保证恢复签到。
 
 ## 测试
 

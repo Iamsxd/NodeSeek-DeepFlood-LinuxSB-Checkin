@@ -6,11 +6,6 @@ on:
       - main
   # 支持在 Actions 页面手动触发，便于验证配置是否生效
   workflow_dispatch:
-    inputs:
-      linuxsb_force_browser:
-        description: 'linux.sb 跳过 requests 探测直接走浏览器通道（验证兜底通道用）'
-        type: boolean
-        default: false
   schedule:
     - cron: '38 0 * * *'  # UTC 00:38，即北京时间 08:38
 
@@ -19,8 +14,6 @@ jobs:
     runs-on: ubuntu-latest
     # 设定时区为北京时间，使脚本内 time.localtime/strftime 输出 UTC+8，
     # 通知里的"执行时间"不再显示 UTC，与签到自然日对齐。
-    # 通知与站间延迟变量放在 job 级：NodeSeek 与 LinuxSB 两个步骤共用，
-    # 避免同一组变量在两个步骤里重复声明。
     env:
       TZ: Asia/Shanghai
       # 两站签到间随机延迟范围（秒，默认 60-180），可调以降低被风控概率
@@ -69,8 +62,6 @@ jobs:
         env:
           NS_COOKIE: ${{ secrets.NS_COOKIE }}
           NS_RANDOM: ${{ vars.NS_RANDOM || secrets.NS_RANDOM }}
-          # 在 xvfb 提供的虚拟显示下跑有头浏览器：headless 指纹会被 Cloudflare 拦在挑战页，
-          # 有头模式指纹更接近真实用户，是目前能通过 5 秒盾的可行方式。
           HEADLESS: "false"
           # 除签到外的任务（评论、加鸡腿）总开关，未配置时默认关闭
           NS_EXTRA_TASKS: ${{ vars.NS_EXTRA_TASKS || secrets.NS_EXTRA_TASKS }}
@@ -80,25 +71,3 @@ jobs:
           DEEPFLOOD_COOKIE: ${{ secrets.DEEPFLOOD_COOKIE }}
         run: |
           xvfb-run -a --server-args="-screen 0 1920x1080x24" python nodeseek_daily.py
-
-      # linux.sb（烧饼社区）2026-08 起会间歇性开启 Cloudflare 托管挑战：命中时
-      # 非浏览器客户端收到 403 + Cf-Mitigated: challenge（本地住宅 IP、补全浏览器
-      # 请求头、curl_cffi 各 impersonate 目标均实测被拦），故脚本被挑战时自动改用
-      # 浏览器过盾再签到；未命中则走 requests 快通道。
-      # 用 xvfb-run 提供虚拟显示，配合 HEADLESS=false 走有头浏览器，与 NodeSeek
-      # 步骤同一配比（--headless=new 与 xvfb 叠加会令元素定位卡死）。
-      - name: Run LinuxSB script
-        env:
-          # linux.sb 签到 cookie（可选，配置后三站顺序签到）
-          LINUXSB_COOKIE: ${{ secrets.LINUXSB_COOKIE }}
-          # 账号密码兜底登录（可选）：cookie 缺失或失效时自动登录，
-          # 格式为 JSON：{"username":"xx","password":"yy"}
-          LINUXSB_ACCOUNT: ${{ secrets.LINUXSB_ACCOUNT }}
-          # 有头模式 + xvfb 虚拟显示（与 NodeSeek 步骤同配比），浏览器登录更稳定
-          HEADLESS: "false"
-          # 手动触发时可勾选，跳过 requests 探测直接验证浏览器通道；
-          # 定时与 push 触发下 inputs 为空，保持 requests 快通道优先
-          LINUXSB_FORCE_BROWSER: ${{ inputs.linuxsb_force_browser && '1' || '' }}
-          # 通知渠道与 SITE_GAP_* 在 job 级 env 已注入，notify.py 读取同一组变量
-        run: |
-          xvfb-run -a --server-args="-screen 0 1920x1080x24" python linuxsb_daily.py

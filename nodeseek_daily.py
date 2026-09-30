@@ -5,6 +5,7 @@ Licensed under the MIT License.
 See LICENSE file in the project root for full license information.
 """
 import os
+import json
 from bs4 import BeautifulSoup
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -15,6 +16,7 @@ import shutil
 import subprocess
 import time
 import traceback
+from urllib.parse import urlsplit, urlunsplit
 import undetected_chromedriver as uc
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
@@ -154,9 +156,7 @@ extra_tasks_enabled = env_bool("NS_EXTRA_TASKS")
 
 randomInputStr = ["bd","绑定","帮顶"]
 
-# Cloudflare 挑战页（"Just a moment..." 5 秒盾）的特征。
-# 命中任一即说明当前页面不是论坛正文，此时任何元素定位都必然超时。
-CF_CHALLENGE_MARKERS = ("just a moment", "challenges.cloudflare.com", "cf-browser-verification")
+CF_CHALLENGE_MARKERS = ("Just a moment", "Checking your browser", "请稍候", "请稍等")
 
 # 签到页相对路径（各站相同，因为 deepflood 与 nodeseek 同一套代码）。
 # 注意 signIn.html 是登录/注册页，不是签到页——二者字面相近容易混淆，
@@ -249,18 +249,46 @@ if SITE_GAP_MIN > SITE_GAP_MAX:
 SIGNED_MARKERS = ("今日签到", "今日已签到", "已经签到", "明天再来", "请明天", "已签到")
 
 
-def is_cloudflare_challenge(driver):
-    """判断当前页面是否停留在 Cloudflare 挑战页。"""
+def cloudflare_challenge_signals(driver):
+    """只检查挑战页特征，不把正常页面加载 Turnstile 脚本视为整页挑战。"""
     try:
-        title = (driver.title or "").lower()
-        if any(marker in title for marker in CF_CHALLENGE_MARKERS):
-            return True
-        # 挑战页体积很小，只截取头部即可判断，避免拉取整页源码
-        head = (driver.page_source or "")[:3000].lower()
-        return any(marker in head for marker in CF_CHALLENGE_MARKERS)
-    except Exception as e:
-        print(f"检测 Cloudflare 挑战页失败: {str(e)}")
-        return False
+        title = (driver.title or "").strip().lower()
+        head = (driver.page_source or "")[:65536].lower()
+        signals = []
+        if any(title.startswith(marker.lower()) for marker in CF_CHALLENGE_MARKERS):
+            signals.append("challenge_title")
+        if re.search(r"(?:window\.)?_cf_chl_opt\s*=", head):
+            signals.append("challenge_configuration")
+        if re.search(r'''\bid\s*=\s*(["'])(?:challenge-form|challenge-running|cf-browser-verification)\1''', head):
+            signals.append("challenge_container")
+        return signals
+    except Exception as error:
+        print(f"检测 Cloudflare 页面失败: {type(error).__name__}", flush=True)
+        return ["page_read_error"]
+
+
+def is_cloudflare_challenge(driver):
+    """页面读取失败时不视为验证通过。"""
+    return bool(cloudflare_challenge_signals(driver))
+
+
+def log_page_diagnostics(driver):
+    """记录固定判定信号和脱敏页面位置，不输出源码、凭据或任意页面标题。"""
+    details = {"signals": cloudflare_challenge_signals(driver)}
+    try:
+        parsed = urlsplit(driver.current_url or "")
+        safe_path = parsed.path if parsed.path in ("", "/", "/board", "/signIn.html") else "/[redacted]"
+        details["url"] = urlunsplit((parsed.scheme, parsed.hostname or "", safe_path, "", ""))
+        title = (driver.title or "").strip().lower()
+        details["title"] = next(
+            (marker for marker in CF_CHALLENGE_MARKERS if title.startswith(marker.lower())),
+            "其他标题（已隐藏）",
+        )
+        version = str(driver.capabilities.get("browserVersion", ""))
+        details["browser_version"] = version if re.fullmatch(r"\d+(?:\.\d+){0,3}", version) else "unknown"
+    except Exception as error:
+        details["diagnostic_error"] = type(error).__name__
+    print(f"[页面诊断] {json.dumps(details, ensure_ascii=False)}", flush=True)
 
 
 def wait_for_cloudflare(driver, timeout=60):
@@ -269,6 +297,7 @@ def wait_for_cloudflare(driver, timeout=60):
     undetected-chromedriver 通常能自动过盾，但需要给它时间；
     这里轮询直到页面不再是挑战页，超时返回 False 由调用方决定如何处理。
     """
+    log_page_diagnostics(driver)
     if not is_cloudflare_challenge(driver):
         return True
 
@@ -281,6 +310,7 @@ def wait_for_cloudflare(driver, timeout=60):
             return True
 
     print("Cloudflare 挑战在超时内未通过")
+    log_page_diagnostics(driver)
     return False
 
 

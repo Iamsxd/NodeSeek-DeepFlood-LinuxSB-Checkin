@@ -8,6 +8,8 @@ nodeseek_daily 依赖 selenium / undetected_chromedriver 等浏览器库，
 import sys
 import types
 import unittest
+import contextlib
+import io
 from unittest import mock
 
 
@@ -222,6 +224,78 @@ class RunTestCase(unittest.TestCase):
 
         self.assertEqual(code, 1)
         self.assertIn("签到异常", send.call_args.args[0])
+
+
+class CloudflareChallengeTestCase(unittest.TestCase):
+    def make_driver(self, title="NodeSeek", source="<html></html>", url="https://www.nodeseek.com/board"):
+        return types.SimpleNamespace(
+            title=title,
+            page_source=source,
+            current_url=url,
+            capabilities={"browserVersion": "153.0.8010.52"},
+        )
+
+    def test_normal_page_with_turnstile_script_is_not_a_challenge(self):
+        driver = self.make_driver(source=(
+            '<html><head><script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script>'
+            '</head><body><button>鸡腿 x 5</button></body></html>'
+        ))
+        self.assertFalse(daily.is_cloudflare_challenge(driver))
+
+    def test_normal_page_mentioning_a_challenge_marker_is_not_a_challenge(self):
+        driver = self.make_driver(source='<html><body>Documentation: cf-browser-verification</body></html>')
+        self.assertFalse(daily.is_cloudflare_challenge(driver))
+
+    def test_challenge_title_is_detected(self):
+        driver = self.make_driver(title="Just a moment...")
+        self.assertTrue(daily.is_cloudflare_challenge(driver))
+
+    def test_challenge_script_configuration_is_detected(self):
+        driver = self.make_driver(source='<html><script>window._cf_chl_opt = {cType: "managed"};</script></html>')
+        self.assertTrue(daily.is_cloudflare_challenge(driver))
+
+    def test_challenge_container_is_detected(self):
+        for container in ("challenge-form", "challenge-running", "cf-browser-verification"):
+            with self.subTest(container=container):
+                driver = self.make_driver(source=f"<html><div id='{container}'></div></html>")
+                self.assertTrue(daily.is_cloudflare_challenge(driver))
+
+    def test_page_read_error_does_not_count_as_challenge_passed(self):
+        driver = mock.Mock()
+        type(driver).title = mock.PropertyMock(side_effect=RuntimeError("private-error-detail"))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertTrue(daily.is_cloudflare_challenge(driver))
+        self.assertNotIn("private-error-detail", output.getvalue())
+
+    def test_diagnostics_do_not_expose_page_or_url_secrets(self):
+        driver = self.make_driver(
+            title="private-account-name",
+            source='<html><body>private-page-data</body></html>',
+            url="https://private-user:private-password@www.nodeseek.com/board?session=private-token#private-fragment",
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            daily.log_page_diagnostics(driver)
+        text = output.getvalue()
+        self.assertIn("www.nodeseek.com/board", text)
+        self.assertIn("153.0.8010.52", text)
+        for secret in ("private-account-name", "private-page-data", "private-user", "private-password", "private-token", "private-fragment"):
+            self.assertNotIn(secret, text)
+
+    def test_wait_does_not_stall_on_normal_turnstile_page(self):
+        driver = self.make_driver(source='<script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script>')
+        with mock.patch.object(daily.time, "sleep") as sleep:
+            self.assertTrue(daily.wait_for_cloudflare(driver, timeout=0))
+        sleep.assert_not_called()
+
+    def test_timed_out_challenge_returns_failure_and_diagnostics(self):
+        driver = self.make_driver(title="Just a moment...")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertFalse(daily.wait_for_cloudflare(driver, timeout=0))
+        self.assertIn("www.nodeseek.com/board", output.getvalue())
+        self.assertIn("Just a moment", output.getvalue())
 
 
 class ShouldSkipCookieTestCase(unittest.TestCase):
